@@ -1,14 +1,43 @@
 use futures::channel::mpsc::{self, Sender, Receiver};
 use futures::channel::oneshot;
-pub struct ConnectionPool<T: Send> {
+use std::fmt::Debug;
+
+pub struct ConnectionPool<T: 'static + Send + Debug> {
     size: usize,
     built: usize,
     connection_builder: Box<dyn Fn() -> T + Send>,
-    connections: Vec<T>,
-    queue_in: Sender<oneshot::Sender<T>>,
-    queue_out: Option<Receiver<oneshot::Sender<T>>>, // FIXME: probably shouldn't belong to the struct?
+    queue_in: Sender<oneshot::Sender<Connection<T>>>,
+    queue_out: Option<Receiver<oneshot::Sender<Connection<T>>>>, // FIXME: probably shouldn't belong to the struct?
     available_sender: Sender<T>,
     available_receiver: Option<Receiver<T>>, // FIXME: probably shouldn't belong to the struct?
+}
+
+#[derive(Debug)]
+pub struct Connection<T: 'static + Send + std::fmt::Debug> {
+    inner: Option<T>,
+    rubberband: Option<Sender<T>>,
+}
+
+impl<T: 'static + Send + std::fmt::Debug> Drop for Connection<T> {
+    fn drop(&mut self) {
+        let mut rubberband = self.rubberband.take().unwrap();
+        let inner = self.inner.take().unwrap();
+
+        async_std::task::spawn(async move {
+            use futures::sink::SinkExt;
+            println!("returning connection: {:?}", inner);
+            rubberband.send(inner).await.unwrap();
+        });
+    }
+}
+
+impl<T: 'static + Send + std::fmt::Debug> Connection<T> {
+    pub fn inner_mut(&mut self) -> Result<&mut T, ()> {
+        match self.inner {
+            Some(ref mut x) => Ok(x),
+            None => Err(())
+        }
+    }
 }
 
 // design:
@@ -23,20 +52,23 @@ pub struct ConnectionPool<T: Send> {
 // checkout sends a message to a queue,
 // includes a oneshot channel that resolves into a connection (reference?)
 
-// FIXME: how to return to pool?
+// FIXME: better way to borrow connection?
+// FIXME: count checkouts/checkins, or just let the await semantics handle it?
+// FIXME: what happens if a connection is dismantled by the borrow task?
+// FIXME: task-local connection checkout?
 impl<T: Send + std::fmt::Debug + 'static> ConnectionPool<T> {
-    pub async fn checkout(&mut self) -> impl futures::Future {
+    pub async fn checkout(&mut self) -> std::result::Result<Connection<T>, futures::channel::oneshot::Canceled> {
         println!("checkout >>> ");
-        let (tx, rx) = oneshot::channel::<T>();
+        let (tx, rx) = oneshot::channel::<Connection<T>>();
 
         use futures::sink::SinkExt;
         self.queue_in.send(tx).await.unwrap();
-        rx
+        rx.await
     }
 
     fn build_connection(&mut self) -> () {
         self.built += 1;
-        let mut cx = (self.connection_builder)();
+        let cx = (self.connection_builder)();
 
         use futures::sink::SinkExt;
 
@@ -52,13 +84,14 @@ impl<T: Send + std::fmt::Debug + 'static> ConnectionPool<T> {
 
         let mut queue_out = self.queue_out.take().unwrap();
         let mut available_connections = self.available_receiver.take().unwrap();
+        let available_sender = self.available_sender.clone();
 
         task::spawn(async move {
             while let Some(tx) = queue_out.next().await {
                 // FIXME: timeout?
                 let cx = available_connections.next().await.unwrap();
                 println!("sending connection to tx={:?}; cx={:?}", tx, cx);
-                tx.send(cx).unwrap();
+                tx.send(Connection { inner: Some(cx), rubberband: Some(available_sender.clone()) }).unwrap();
             }
         });
     }
@@ -75,7 +108,6 @@ mod tests {
             size: 10,
             built: 0,
             connection_builder: Box::new(|| vec![1u8]),
-            connections: Vec::new(),
             queue_in: tx,
             queue_out: Some(rx),
             available_sender,
@@ -83,16 +115,16 @@ mod tests {
         };
 
         pool.build_connection();
-        pool.build_connection();
-        pool.build_connection();
-        pool.build_connection();
-        pool.build_connection();
         pool.spawn_server_loop();
 
         use futures::future::FutureExt;
-        let c = async_std::task::block_on(async { pool.checkout().map(|i| i).await });
+        {
+            let mut c = async_std::task::block_on(async { pool.checkout().await.unwrap() });
+            c.inner_mut().map(|x| x.push(2)).unwrap();
+        }
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        // println!("{:?}", c);
+        let mut d = async_std::task::block_on(async { pool.checkout().await.unwrap() });
+        d.inner_mut().map(|x| x.push(3)).unwrap();
+        println!("checkout2: {:?}", d);
     }
 }
