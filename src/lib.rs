@@ -1,6 +1,14 @@
+// meta FIXME: this should be more like a GenServer.
+// I.e., the ConnectionPool has an internal state, and a mailbox
+// handle_cast with a checkout message should reply to a oneshot sender with a future
+// that eventually resolves into a connection, either as the result of the connection being built,
+// or as the result of another connection being returned to the pool.
+//
 use futures::channel::mpsc::{self, Sender, Receiver};
 use futures::channel::oneshot;
 use std::fmt::Debug;
+use futures::sink::SinkExt;
+use std::collections::HashMap;
 
 pub struct ConnectionPool<T: 'static + Send + Debug> {
     size: usize,
@@ -10,12 +18,23 @@ pub struct ConnectionPool<T: 'static + Send + Debug> {
     queue_out: Option<Receiver<oneshot::Sender<Connection<T>>>>, // FIXME: probably shouldn't belong to the struct?
     available_sender: Sender<T>,
     available_receiver: Option<Receiver<T>>, // FIXME: probably shouldn't belong to the struct?
+    connections: HashMap<usize, Option<AvailableConnection<T>>>,
+    waiter_receiver: Receiver<()>,
+    waiter_sender: Sender<()>
+}
+
+#[derive(Debug)]
+struct AvailableConnection<T: 'static + Send + Debug> {
+    index: usize,
+    inner: Option<T>,
+    prepared: bool,
 }
 
 #[derive(Debug)]
 pub struct Connection<T: 'static + Send + std::fmt::Debug> {
     inner: Option<T>,
     rubberband: Option<Sender<T>>,
+    index: usize
 }
 
 impl<T: 'static + Send + std::fmt::Debug> Drop for Connection<T> {
@@ -24,7 +43,6 @@ impl<T: 'static + Send + std::fmt::Debug> Drop for Connection<T> {
         let inner = self.inner.take().unwrap();
 
         async_std::task::spawn(async move {
-            use futures::sink::SinkExt;
             println!("returning connection: {:?}", inner);
             rubberband.send(inner).await.unwrap();
         });
@@ -57,24 +75,29 @@ impl<T: 'static + Send + std::fmt::Debug> Connection<T> {
 // FIXME: what happens if a connection is dismantled by the borrow task?
 // FIXME: task-local connection checkout?
 impl<T: Send + std::fmt::Debug + 'static> ConnectionPool<T> {
+
     pub async fn checkout(&mut self) -> std::result::Result<Connection<T>, futures::channel::oneshot::Canceled> {
         println!("checkout >>> ");
         let (tx, rx) = oneshot::channel::<Connection<T>>();
 
-        use futures::sink::SinkExt;
         self.queue_in.send(tx).await.unwrap();
         rx.await
     }
 
     fn build_connection(&mut self) -> () {
         self.built += 1;
+        let index = self.built.clone();
         let cx = (self.connection_builder)();
 
-        use futures::sink::SinkExt;
+        let connection = Connection {
+            index,
+            inner: Some(cx)
+        }
 
-        println!("<<< connection built {:?}", cx);
+        self.available_connections.insert(index, AvailableConnection { prepared: true, inner: None });
+        println!("<<< connection built {:?}", connection);
         // FIXME: should block?
-        async_std::task::block_on(async { self.available_sender.send(cx).await.unwrap() });
+        async_std::task::block_on(async { self.available_sender.send(connection).await.unwrap() });
     }
 
     // FIXME: no async_std?
@@ -85,11 +108,20 @@ impl<T: Send + std::fmt::Debug + 'static> ConnectionPool<T> {
         let mut queue_out = self.queue_out.take().unwrap();
         let mut available_connections = self.available_receiver.take().unwrap();
         let available_sender = self.available_sender.clone();
+        let waiter_sender = self.waiter_sender.clone();
 
         task::spawn(async move {
             while let Some(tx) = queue_out.next().await {
-                // FIXME: timeout?
-                let cx = available_connections.next().await.unwrap();
+                let cx = match available_connections.try_next() {
+                    Ok(Some(t)) => { t },
+                    Ok(None) => { // ?
+                    },
+                    Err(e) => {
+                        println!("{:?}", e);
+                        waiter_sender.send(()).await.unwrap();
+                        available_connections.next().await.unwrap();
+                    }
+                }
                 println!("sending connection to tx={:?}; cx={:?}", tx, cx);
                 tx.send(Connection { inner: Some(cx), rubberband: Some(available_sender.clone()) }).unwrap();
             }
@@ -104,6 +136,7 @@ mod tests {
     fn it_works() {
         let (tx, rx) = mpsc::channel(512); // FIXME: bound?
         let (available_sender, available_reciever) = mpsc::channel(512); // FIXME: bound to pool size!
+        let (waiter_sender, waiter_receiver) = mpsc::channel(512);
         let mut pool: ConnectionPool<Vec<u8>> = ConnectionPool {
             size: 10,
             built: 0,
@@ -112,6 +145,8 @@ mod tests {
             queue_out: Some(rx),
             available_sender,
             available_receiver: Some(available_reciever),
+            waiter_sender,
+            waiter_receiver,
         };
 
         pool.build_connection();
