@@ -4,12 +4,12 @@
 // that eventually resolves into a connection, either as the result of the connection being built,
 // or as the result of another connection being returned to the pool.
 //
-use futures::channel::mpsc::{self, Sender, Receiver};
+use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::channel::oneshot;
-use std::fmt::Debug;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 #[derive(Debug)]
 pub struct Connection<T: 'static + Send + Debug> {
@@ -33,7 +33,7 @@ impl<T: 'static + Send + std::fmt::Debug> Connection<T> {
     pub fn inner_mut(&mut self) -> Result<&mut T, ()> {
         match self.inner {
             Some(ref mut x) => Ok(x),
-            None => Err(())
+            None => Err(()),
         }
     }
 }
@@ -64,14 +64,11 @@ impl<T: 'static + Send + Debug> ConnectionPoolHandle<T> {
         use futures::future::FutureExt;
 
         // Ok(
-            rx.map(|cx| {
-                Connection {
-                    inner: Some(cx.unwrap()),
-                    rubberband: Some(
-                        self.event_sender.clone()
-                    )
-                }
-            }).await
+        rx.map(|cx| Connection {
+            inner: Some(cx.unwrap()),
+            rubberband: Some(self.event_sender.clone()),
+        })
+        .await
         // )
     }
 }
@@ -84,7 +81,7 @@ impl<T: 'static + Send + Debug> ConnectionPool<T> {
             built: 0,
             event_sender,
             events,
-            connection_builder: builder
+            connection_builder: builder,
         }
     }
 
@@ -96,12 +93,10 @@ impl<T: 'static + Send + Debug> ConnectionPool<T> {
         while let Some(event) = self.events.next().await {
             match event {
                 // FIXME: check health?
-                Event::Return(cx) => {
-                    match waiters.pop_front() {
-                        Some(sender) => sender.send(cx).unwrap(),
-                        None => available.push_back(cx),
-                    }
-                }
+                Event::Return(cx) => match waiters.pop_front() {
+                    Some(sender) => sender.send(cx).unwrap(),
+                    None => available.push_back(cx),
+                },
                 Event::Wait(sender) => {
                     match available.pop_front() {
                         Some(cx) => sender.send(cx).unwrap(),
@@ -109,7 +104,7 @@ impl<T: 'static + Send + Debug> ConnectionPool<T> {
                             if self.built < self.size {
                                 self.built += 1;
                                 let cx = (self.connection_builder)();
-                                sender.send(cx);
+                                sender.send(cx).unwrap();
                             } else {
                                 waiters.push_back(sender); // FIXME: handle overflow
                             }
