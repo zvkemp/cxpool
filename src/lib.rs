@@ -8,33 +8,13 @@ use futures::channel::mpsc::{self, Sender, Receiver};
 use futures::channel::oneshot;
 use std::fmt::Debug;
 use futures::sink::SinkExt;
+use futures::stream::StreamExt;
 use std::collections::HashMap;
 
-pub struct ConnectionPool<T: 'static + Send + Debug> {
-    size: usize,
-    built: usize,
-    connection_builder: Box<dyn Fn() -> T + Send>,
-    queue_in: Sender<oneshot::Sender<Connection<T>>>,
-    queue_out: Option<Receiver<oneshot::Sender<Connection<T>>>>, // FIXME: probably shouldn't belong to the struct?
-    available_sender: Sender<T>,
-    available_receiver: Option<Receiver<T>>, // FIXME: probably shouldn't belong to the struct?
-    connections: HashMap<usize, Option<AvailableConnection<T>>>,
-    waiter_receiver: Receiver<()>,
-    waiter_sender: Sender<()>
-}
-
 #[derive(Debug)]
-struct AvailableConnection<T: 'static + Send + Debug> {
-    index: usize,
+pub struct Connection<T: 'static + Send + Debug> {
     inner: Option<T>,
-    prepared: bool,
-}
-
-#[derive(Debug)]
-pub struct Connection<T: 'static + Send + std::fmt::Debug> {
-    inner: Option<T>,
-    rubberband: Option<Sender<T>>,
-    index: usize
+    rubberband: Option<Sender<Event<T>>>,
 }
 
 impl<T: 'static + Send + std::fmt::Debug> Drop for Connection<T> {
@@ -44,7 +24,7 @@ impl<T: 'static + Send + std::fmt::Debug> Drop for Connection<T> {
 
         async_std::task::spawn(async move {
             println!("returning connection: {:?}", inner);
-            rubberband.send(inner).await.unwrap();
+            rubberband.send(Event::Return(inner)).await.unwrap();
         });
     }
 }
@@ -58,78 +38,91 @@ impl<T: 'static + Send + std::fmt::Debug> Connection<T> {
     }
 }
 
-// design:
-//
-// calling checkout returns a future; await returns a &mut connection
-//
-// the future polls until a connection is available
-// do we need channels?
-//
-// internal:
-//
-// checkout sends a message to a queue,
-// includes a oneshot channel that resolves into a connection (reference?)
+pub struct ConnectionPool<T: 'static + Send + Debug> {
+    size: usize,
+    built: usize,
+    event_sender: Sender<Event<T>>,
+    events: Receiver<Event<T>>,
+    connection_builder: Box<dyn Fn() -> T + Send>,
+}
 
-// FIXME: better way to borrow connection?
-// FIXME: count checkouts/checkins, or just let the await semantics handle it?
-// FIXME: what happens if a connection is dismantled by the borrow task?
-// FIXME: task-local connection checkout?
-impl<T: Send + std::fmt::Debug + 'static> ConnectionPool<T> {
+#[derive(Debug)]
+pub enum Event<T> {
+    Wait(oneshot::Sender<T>),
+    Return(T),
+}
 
-    pub async fn checkout(&mut self) -> std::result::Result<Connection<T>, futures::channel::oneshot::Canceled> {
-        println!("checkout >>> ");
-        let (tx, rx) = oneshot::channel::<Connection<T>>();
+pub struct ConnectionPoolHandle<T: 'static + Send + Debug> {
+    event_sender: Sender<Event<T>>,
+}
 
-        self.queue_in.send(tx).await.unwrap();
-        rx.await
-    }
+impl<T: 'static + Send + Debug> ConnectionPoolHandle<T> {
+    pub async fn checkout(&mut self) -> Connection<T> {
+        let (tx, rx) = oneshot::channel::<T>();
+        self.event_sender.send(Event::Wait(tx)).await.unwrap();
 
-    fn build_connection(&mut self) -> () {
-        self.built += 1;
-        let index = self.built.clone();
-        let cx = (self.connection_builder)();
+        use futures::future::FutureExt;
 
-        let connection = Connection {
-            index,
-            inner: Some(cx)
-        }
-
-        self.available_connections.insert(index, AvailableConnection { prepared: true, inner: None });
-        println!("<<< connection built {:?}", connection);
-        // FIXME: should block?
-        async_std::task::block_on(async { self.available_sender.send(connection).await.unwrap() });
-    }
-
-    // FIXME: no async_std?
-    fn spawn_server_loop(&mut self) -> () {
-        use async_std::task;
-        use futures::prelude::*;
-
-        let mut queue_out = self.queue_out.take().unwrap();
-        let mut available_connections = self.available_receiver.take().unwrap();
-        let available_sender = self.available_sender.clone();
-        let waiter_sender = self.waiter_sender.clone();
-
-        task::spawn(async move {
-            while let Some(tx) = queue_out.next().await {
-                let cx = match available_connections.try_next() {
-                    Ok(Some(t)) => { t },
-                    Ok(None) => { // ?
-                    },
-                    Err(e) => {
-                        println!("{:?}", e);
-                        waiter_sender.send(()).await.unwrap();
-                        available_connections.next().await.unwrap();
-                    }
+        // Ok(
+            rx.map(|cx| {
+                Connection {
+                    inner: Some(cx.unwrap()),
+                    rubberband: Some(
+                        self.event_sender.clone()
+                    )
                 }
-                println!("sending connection to tx={:?}; cx={:?}", tx, cx);
-                tx.send(Connection { inner: Some(cx), rubberband: Some(available_sender.clone()) }).unwrap();
-            }
-        });
+            }).await
+        // )
     }
 }
 
-#[cfg(test)]
+impl<T: 'static + Send + Debug> ConnectionPool<T> {
+    pub fn build(builder: Box<dyn Fn() -> T + Send>) -> Self {
+        let (event_sender, events) = mpsc::channel(512);
+        ConnectionPool {
+            size: 10,
+            built: 0,
+            event_sender,
+            events,
+            connection_builder: builder
+        }
+    }
+
+    async fn run(&mut self) -> Result<(), ()> {
+        use std::collections::VecDeque;
+        let mut available: VecDeque<T> = VecDeque::with_capacity(10);
+        let mut waiters: VecDeque<oneshot::Sender<T>> = VecDeque::with_capacity(512);
+
+        while let Some(event) = self.events.next().await {
+            match event {
+                // FIXME: check health?
+                Event::Return(cx) => {
+                    match waiters.pop_front() {
+                        Some(sender) => sender.send(cx).unwrap(),
+                        None => available.push_back(cx),
+                    }
+                }
+                Event::Wait(sender) => {
+                    match available.pop_front() {
+                        Some(cx) => sender.send(cx).unwrap(),
+                        None => {
+                            if self.built < self.size {
+                                self.built += 1;
+                                let cx = (self.connection_builder)();
+                                sender.send(cx);
+                            } else {
+                                waiters.push_back(sender); // FIXME: handle overflow
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 mod tests {
     use super::*;
     #[test]
