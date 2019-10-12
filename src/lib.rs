@@ -63,13 +63,10 @@ impl<T: 'static + Send + Debug> ConnectionPoolHandle<T> {
 
         use futures::future::FutureExt;
 
-        // Ok(
         rx.map(|cx| Connection {
             inner: Some(cx.unwrap()),
             rubberband: Some(self.event_sender.clone()),
-        })
-        .await
-        // )
+        }).await
     }
 }
 
@@ -83,6 +80,10 @@ impl<T: 'static + Send + Debug> ConnectionPool<T> {
             events,
             connection_builder: builder,
         }
+    }
+
+    pub fn handle(&self) -> ConnectionPoolHandle<T> {
+        ConnectionPoolHandle { event_sender: self.event_sender.clone() }
     }
 
     async fn run(&mut self) -> Result<(), ()> {
@@ -112,6 +113,8 @@ impl<T: 'static + Send + Debug> ConnectionPool<T> {
                     }
                 }
             }
+
+            println!("built={:?}; available={:?}; waiting={:?}", self.built, available, waiters);
         }
 
         Ok(())
@@ -122,31 +125,19 @@ mod tests {
     use super::*;
     #[test]
     fn it_works() {
-        let (tx, rx) = mpsc::channel(512); // FIXME: bound?
-        let (available_sender, available_reciever) = mpsc::channel(512); // FIXME: bound to pool size!
-        let (waiter_sender, waiter_receiver) = mpsc::channel(512);
-        let mut pool: ConnectionPool<Vec<u8>> = ConnectionPool {
-            size: 10,
-            built: 0,
-            connection_builder: Box::new(|| vec![1u8]),
-            queue_in: tx,
-            queue_out: Some(rx),
-            available_sender,
-            available_receiver: Some(available_reciever),
-            waiter_sender,
-            waiter_receiver,
-        };
+        let mut pool = ConnectionPool::build(Box::new(|| Vec::<u8>::new()));
+        let mut handle = pool.handle();
 
-        pool.build_connection();
-        pool.spawn_server_loop();
+        async_std::task::spawn(async move { pool.run().await });
 
         use futures::future::FutureExt;
         {
-            let mut c = async_std::task::block_on(async { pool.checkout().await.unwrap() });
+            let mut c = async_std::task::block_on(async { handle.checkout().await });
             c.inner_mut().map(|x| x.push(2)).unwrap();
         }
 
-        let mut d = async_std::task::block_on(async { pool.checkout().await.unwrap() });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut d = async_std::task::block_on(async { handle.checkout().await });
         d.inner_mut().map(|x| x.push(3)).unwrap();
         println!("checkout2: {:?}", d);
     }
